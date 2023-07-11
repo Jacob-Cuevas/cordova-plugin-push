@@ -1,12 +1,13 @@
 package com.adobe.phonegap.push
 
+import android.R
 import android.annotation.SuppressLint
 import android.annotation.TargetApi
-import android.app.Activity
-import android.app.NotificationChannel
-import android.app.NotificationManager
+import android.app.*
 import android.content.ContentResolver
 import android.content.Context
+import android.content.DialogInterface
+import android.content.Intent
 import android.content.res.Resources.NotFoundException
 import android.media.AudioAttributes
 import android.net.Uri
@@ -14,6 +15,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.google.android.gms.tasks.Tasks
@@ -26,6 +28,7 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.*
 import java.util.concurrent.ExecutionException
+
 
 /**
  * Cordova Plugin Push
@@ -45,6 +48,8 @@ class PushPlugin : CordovaPlugin() {
     private var pushContext: CallbackContext? = null
     private var gWebView: CordovaWebView? = null
     private val gCachedExtras = Collections.synchronizedList(ArrayList<Bundle>())
+
+    private const val GRANTED_POLICY_ACCESS = 109
 
     /**
      *
@@ -101,6 +106,14 @@ class PushPlugin : CordovaPlugin() {
             when {
               jsonKeySet.contains(key) -> {
                 json.put(key, value)
+              }
+
+              key == PushConstants.BUNDLE_KEY_OPEN_ALL_NOTIFICATIONS -> {
+                additionalData.put(key, extras.getBoolean(PushConstants.BUNDLE_KEY_OPEN_ALL_NOTIFICATIONS))
+              }
+
+              key == PushConstants.TAPPED -> {
+                additionalData.put(key, extras.getBoolean(PushConstants.TAPPED))
               }
 
               key == PushConstants.COLDSTART -> {
@@ -296,6 +309,7 @@ class PushPlugin : CordovaPlugin() {
     }
   }
 
+  @SuppressLint("NewApi")
   private fun getNotificationChannelSound(channelData: JSONObject): Pair<Uri?, AudioAttributes?> {
     val audioAttributes = AudioAttributes.Builder()
       .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
@@ -373,6 +387,45 @@ class PushPlugin : CordovaPlugin() {
     }
   }
 
+
+  /**
+   * Method invoken once the user is returned from the System app.
+   *
+   * @param requestCode The request code originally supplied to startActivityForResult(),
+   * allowing you to identify who this result came from.
+   * @param resultCode  The integer result code returned by the child activity through its setResult().
+   * @param intent      An Intent, which can return result data to the caller (various data can be attached to Intent "extras").
+   */
+  @RequiresApi(Build.VERSION_CODES.P)
+  override fun onActivityResult(requestCode: Int, resultCode: Int, intent: Intent?) {
+    if (requestCode >= GRANTED_POLICY_ACCESS) {
+
+      // Check if the app has permission to modify the DO NOT DISTURB option and settings.
+      val notificationManager =
+        applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+      // Check if the current device is using a valid Android OS version.
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+        // Check if the "Do not disturb" option is currently activated. This mode will always hide all notifications UNLESS we add this app in the exception list.
+        // The "INTERRUPTION_FILTER_ALL" constant indicates that no notifications are suppressed.
+        if (notificationManager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) {
+
+          // Once we have access to the "Do not disturb" settings, we add a new filter that will allow us to display our notifications on screen
+          // even if option is currently activated.
+          notificationManager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
+          notificationManager.setNotificationPolicy(
+            NotificationManager.Policy(
+              NotificationManager.Policy.PRIORITY_CATEGORY_ALARMS,
+              0,
+              0
+            )
+          )
+        }
+      }
+    }
+  }
+
   /**
    * Performs various push plugin related tasks:
    *
@@ -388,6 +441,8 @@ class PushPlugin : CordovaPlugin() {
    *  - Create Channel
    *  - Delete Channel
    *  - List Channels
+   *  - Remove specific notification from OS tray
+   *  - Change DoNotDisturb settings
    *
    *  @param action
    *  @param data
@@ -420,6 +475,8 @@ class PushPlugin : CordovaPlugin() {
       PushConstants.DELETE_CHANNEL -> executeActionDeleteChannel(data, callbackContext)
       PushConstants.LIST_CHANNELS -> executeActionListChannels(callbackContext)
       PushConstants.CLEAR_NOTIFICATION -> executeActionClearNotification(data, callbackContext)
+      PushConstants.REMOVE_NOTIFICATION_FROM_TRAY_BY_NOTIFICATION_ID -> executeRemoveNotificationFromTray(data, callbackContext)
+      PushConstants.CHANGE_DND_FROM_CORES -> executeModifyDNDsettings(data, callbackContext)
       else -> {
         Log.e(TAG, "Execute: Invalid Action $action")
         callbackContext.sendPluginResult(PluginResult(PluginResult.Status.INVALID_ACTION))
@@ -429,11 +486,243 @@ class PushPlugin : CordovaPlugin() {
     return true
   }
 
+  /**
+   * Method to invoke the function that will open the "Do Not Disturb" settings of the phone.
+   */
+  private fun executeModifyDNDsettings(data: JSONArray, callbackContext: CallbackContext) {
+    cordova.threadPool.execute {
+      try {
+
+        Log.v(TAG, "executeModifyDNDsettings: data=$data");
+
+        openDoNotDisturbSettings();
+
+        callbackContext.success()
+
+      } catch (e: java.lang.Exception) {
+        callbackContext.error(e.message)
+      }
+    }
+  }
+
+  /**
+   * Method to open the "Do Not Disturb" phone settings.
+   */
+  private fun openDoNotDisturbSettings(){
+    // Request to the user access to the DND settings. If this is granted then the DND settings will be opened.
+    val intent = Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    applicationContext.startActivity(intent)
+    cordova.startActivityForResult(this, intent, GRANTED_POLICY_ACCESS)
+  }
+
+  /**
+   * Method used to remove a notification from the OS tray by an ID
+   */
+  @SuppressLint("NewApi")
+  private fun executeRemoveNotificationFromTray(data: JSONArray, callbackContext: CallbackContext) {
+    cordova.threadPool.execute {
+      try {
+
+        Log.v(TAG, "executeRemoveNotificationFromTray: data=$data");
+
+        // Get the CORES ID that identifies the notification received in the phone.
+        var coresNotificationID = data.getJSONObject(0).getInt(PushConstants.CORES_NOTIFICATION_ID_KEY)
+
+        val fcm = FCMService()
+
+        val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        // Get the list of notifications that are currently displayed in the Android tray.
+        val activeNotifications = notificationManager.activeNotifications
+
+        // Iterate the current notifications of the OS tray.
+        for (statusBarNotification in activeNotifications) {
+          if (statusBarNotification.id == coresNotificationID) {
+            // Remove the notification from the tray.
+            notificationManager.cancel(coresNotificationID)
+            break
+          }
+        }
+
+        // Since the notifications displayed in the tray can be may be unordered, we must sort them by ID in ascending order.
+        // We want to have the following order:
+        /*
+          [0] = "Open all" notification.
+          [1] = grouper notification.
+          [2 to n] = push notification.
+        */
+        activeNotifications.sort()
+
+        // Iterate again the ordered list of notifications that are displayed in the OS tray.
+        for (statusBarNotification in activeNotifications) {
+          val notification: Notification = statusBarNotification.notification
+          if (statusBarNotification.id == PushConstants.OPEN_ALL_NOTIFICATION_ID) {
+            // Ignored, it will be updated according to the content of the grouper notification.
+          } else  // Refresh the content of the notification grouper and the "Open all" notification (both local notifications created by us to manage the push notifications).
+            if (statusBarNotification.id == PushConstants.GROUP_NOTIFICATION_ID) {
+
+              // Get the list of IDs of the notifications that were grouped by this notification.
+              val stringListIDconcatenated: String? =
+                notification.extras.getString(PushConstants.BUNDLE_KEY_OPEN_ALL_NOTIFICATIONS)
+              val groupedNotificationIDList: MutableList<String> = stringListIDconcatenated!!.split(",").toMutableList()
+
+              // Iterate the list to remove the notification that was canceled.
+              for (groupedNotificationID in groupedNotificationIDList) {
+                if (groupedNotificationID == coresNotificationID.toString()) {
+                  // Update the list of notifications.
+                  groupedNotificationIDList.remove(groupedNotificationID)
+                  break
+                }
+              }
+
+              // Update the content of the notification grouper.
+              // First, update the list that is used to create the content of this grouper.
+
+              // Check if the list of received push notifications is empty.
+              if (fcm.getMessageMap().size == 0) {
+
+                // When the app was closed and the user opens it, this list can be empty even if there are notifications in the OS tray.
+                // So we need to get the notifications that were grouped extracting them from the bundle of the grouper.
+                try {
+
+                  // Get the JSON string stored in the bundle object of the notification grouper and convert it to a JSON object that can be iterated.
+                  val jsonObjectGroupedNotificationsWithContent = JSONObject(
+                    notification.extras.getString(PushConstants.BUNDLE_KEY_NOTIFICATIONS_GROUPED_WITH_CONTENT)
+                  )
+
+                  // Iterate the notification objects to add them to the list of received push notifications.
+                  val keys: JSONArray = jsonObjectGroupedNotificationsWithContent.names()
+                  for (i in 0 until keys.length()) {
+                    val key = keys.getString(i)
+                    val notificationContent: String =
+                      jsonObjectGroupedNotificationsWithContent.getString(key)
+
+                    // Ignore the canceled notification.
+                    if (Integer.valueOf(key) != coresNotificationID) {
+
+                      // Add the current notification to the list.
+                      fcm.setNotification(Integer.valueOf(key), notificationContent)
+                      fcm.setCoresNotificationIDTolist(key)
+                    }
+                  }
+                } catch (e: JSONException) {
+                  e.printStackTrace()
+                }
+              } else {
+
+                // Remove from the received and processed lists the notification that was canceled.
+                fcm.setNotification(coresNotificationID, "")
+                fcm.removeCoresNotificationIDfromList(coresNotificationID.toString())
+              }
+
+              // Once both lists are ready (received push notifications and processed items), then we need to:
+              // - Refresh the content of the notification grouper.
+              notificationManager.cancel(PushConstants.GROUP_NOTIFICATION_ID)
+
+              // Check if there are enough notifications in the OS tray to continue displaying the "Open All" notification.
+              if (groupedNotificationIDList.size === 1) {
+
+                // Remove the "Open all" notification from the OS tray,since there is only 1 item in the tray.
+                notificationManager.cancel(PushConstants.OPEN_ALL_NOTIFICATION_ID)
+              } else if (groupedNotificationIDList.size === 0) {
+
+                // Remove all notifications from the tray.
+                notificationManager.cancelAll()
+
+                // Clear the lists used to identify when a push notification is received.
+                fcm.cleanNotificationList()
+                fcm.cleanCoresNotificationIDList()
+              } else {
+
+                // Refresh the notification grouper to update the displayed summary text (replacing the current notification grouper with a new one but using the same data to
+                // avoid losing the notifications that are currently grouped by it).
+                fcm.displayGrouperNotification(
+                  notification.extras,
+                  applicationContext,
+                  notification.getChannelId(),
+                  notificationManager
+                )
+
+                // Update the data stored in the "open all" notification, since we need to indicate a notification was removed from the tray.
+                fcm.createOpenAllNotification(
+                  notificationManager,
+                  applicationContext,
+                  notification.getChannelId(),
+                  notification.extras
+                )
+              }
+            } else {
+
+              // A push notification object.
+
+              // Once the notification grouper summary has been updated, we need to resend the push notification to update the list of notifications displayed when the grouper
+              // is expanded.
+              if (statusBarNotification.id != coresNotificationID) {
+
+                // To be able to add the existing notification to the grouper, we need to remove it from the OS and display it again with the same content.
+                notificationManager.cancel(statusBarNotification.id)
+                notificationManager.notify(statusBarNotification.id, notification)
+              } else {
+
+                // We need to remove the canceled notification from the lists used to manage the received push.
+                fcm.setNotification(coresNotificationID, "")
+                fcm.removeCoresNotificationIDfromList(coresNotificationID.toString())
+              }
+            }
+        }
+        callbackContext.success()
+
+      } catch (e: java.lang.Exception) {
+        callbackContext.error(e.message)
+      }
+    }
+  }
+
+
   private fun executeActionInitialize(data: JSONArray, callbackContext: CallbackContext) {
     // Better Logging
     fun formatLogMessage(msg: String): String = "Execute::Initialize: ($msg)"
 
+    // Check if the plugin was re-initialized to ask access to the "Do Not Disturb" permission.
+    try {
+      if (data.getJSONObject(0).getJSONObject("android")
+          .has("requestDoNotDisturbAccess") === true && data.getJSONObject(0)
+          .getJSONObject("android").get("requestDoNotDisturbAccess").equals(true)
+      ) {
+
+        // Check if the app has permission to modify the DO NOT DISTURB option and settings.
+        val notificationManager =
+          applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        // Check if the current device is using a valid Android OS version.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+          // Validate if the user already has the permission.
+          if (!notificationManager.isNotificationPolicyAccessGranted) {
+
+            // Display a message to the user indicating the app will redirect him to the Settings -> Sound & Notifcation -> Do Not Disturb Access.
+            AlertDialog.Builder(cordova.activity)
+              .setTitle("Enable 'Do Not Disturb' Access?")
+              .setMessage("In order to always receive critical result alerts when your phone is muted or in Do Not Disturb mode, you will need to enable 'Do Not Disturb' access.")
+              .setIcon(R.drawable.ic_dialog_alert)
+              .setPositiveButton(
+                "OK",
+                DialogInterface.OnClickListener { dialog, whichButton -> // Trigger an intent to redirect the user to the System settings.
+                  openDoNotDisturbSettings()
+                })
+              .setNegativeButton("NOT RIGHT NOW", DialogInterface.OnClickListener { dialog, which ->
+                // There is no logic at the moment for this button.
+              }).show()
+          }
+        }
+      }
+    } catch (e: java.lang.Exception) {
+      e.printStackTrace()
+    }
+
     cordova.threadPool.execute(Runnable {
+
       Log.v(TAG, formatLogMessage("Data=$data"))
 
       pushContext = callbackContext

@@ -39,6 +39,9 @@
 @synthesize notificationMessage;
 @synthesize isInline;
 @synthesize coldstart;
+@synthesize isTapped;
+@synthesize notificationIDsToOpen;
+@synthesize notificationsGroupedContentList;
 
 @synthesize callbackId;
 @synthesize notificationCallbackId;
@@ -211,7 +214,10 @@
             } else {
                 NSLog(@"PushPlugin.register: setting badge to true");
                 clearBadge = YES;
-                [[UIApplication sharedApplication] setApplicationIconBadgeNumber:0];
+                //zero badge
+                // To clear the badge number without remove the notifications from the tray we need to set -1 instead of 0
+                // https://developer.apple.com/forums/thread/7598
+                [[UIApplication sharedApplication] setApplicationIconBadgeNumber:-1];
             }
             NSLog(@"PushPlugin.register: clear badge is set to %d", clearBadge);
 
@@ -462,6 +468,13 @@
             [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"coldstart"];
         }
 
+         if(isTapped){
+            [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"isTapped"];
+            
+        } else {
+            [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"isTapped"];
+        }
+
         [message setObject:additionalData forKey:@"additionalData"];
 
         // send notification message
@@ -471,7 +484,197 @@
 
         self.coldstart = NO;
         self.notificationMessage = nil;
+        self.isTapped = NO;
+
+    } else {
+
+        NSUInteger length = notificationIDsToOpen.length;
+        
+        if(length > 0){
+            
+            NSLog(@"Open all notifications");
+            
+            NSMutableDictionary* message = [NSMutableDictionary dictionaryWithCapacity:4];
+            NSMutableDictionary* additionalData = [NSMutableDictionary dictionaryWithCapacity:4];
+            
+            if (isInline) {
+                [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"foreground"];
+            } else {
+                [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"foreground"];
+            }
+
+            if (coldstart) {
+                [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"coldstart"];
+            } else {
+                [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"coldstart"];
+            }
+            
+            if(isTapped){
+                [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"isTapped"];
+                
+                [additionalData setObject:notificationsGroupedContentList forKey:@"notificationsGroupedContentList"];
+                
+                [additionalData setObject:notificationIDsToOpen forKey:@"notificationsToOpen"];
+                
+            } else {
+                [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"isTapped"];
+            }
+            
+            [message setObject:additionalData forKey:@"additionalData"];
+            
+            // send notification message
+            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:message];
+            [pluginResult setKeepCallbackAsBool:YES];
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+
+            self.coldstart = NO;
+            self.notificationMessage = nil;
+            self.isTapped = NO;
+            
+        } else {
+            
+            // Notification grouper.
+            NSLog(@"Grouped notifications");
+            
+            NSMutableDictionary* message = [NSMutableDictionary dictionaryWithCapacity:4];
+            NSMutableDictionary* additionalData = [NSMutableDictionary dictionaryWithCapacity:4];
+            
+            if (isInline) {
+                [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"foreground"];
+            } else {
+                [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"foreground"];
+            }
+
+            if (coldstart) {
+                [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"coldstart"];
+            } else {
+                [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"coldstart"];
+            }
+            
+            if(isTapped){
+                [additionalData setObject:[NSNumber numberWithBool:YES] forKey:@"isTapped"];
+                
+                [additionalData setObject:notificationsGroupedContentList forKey:@"notificationsGroupedContentList"];
+                
+            } else {
+                [additionalData setObject:[NSNumber numberWithBool:NO] forKey:@"isTapped"];
+            }
+            
+            [message setObject:additionalData forKey:@"additionalData"];
+            
+            // send notification message
+            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:message];
+            [pluginResult setKeepCallbackAsBool:YES];
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+
+            self.coldstart = NO;
+            self.notificationMessage = nil;
+            self.isTapped = NO;
+            
+        }
+
     }
+}
+
+/*
+ Method used to remove a single notification from the tray by a specific notificationID.
+ */
+- (void)removeNotificationFromTray:(CDVInvokedUrlCommand *)command
+{
+
+    NSMutableDictionary* options = [command.arguments objectAtIndex:0];
+    NSNumber *notId = [options objectForKey:@"notification_id"];
+
+    // Get the list of notifications (local and delivered) from the OS tray.
+    [[UNUserNotificationCenter currentNotificationCenter] getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * _Nonnull notifications) {
+        
+        //The server sends the notifications with a specific "notId" to be able to identify each notification in the tray.
+        
+        NSPredicate *matchingNotificationPredicate = [NSPredicate predicateWithFormat:@"request.content.userInfo.notId == %@", notId];
+        NSArray<UNNotification *> *matchingNotifications = [notifications filteredArrayUsingPredicate:matchingNotificationPredicate];
+        NSMutableArray<NSString *> *matchingNotificationIdentifiers = [NSMutableArray array];
+        for (UNNotification *notification in matchingNotifications) {
+            [matchingNotificationIdentifiers addObject:notification.request.identifier];
+        }
+        
+        if(matchingNotificationIdentifiers.count > 0){
+            
+            // Remove the specific notification from the OS tray.
+            [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:matchingNotificationIdentifiers];
+            
+            // The following logic is used to decide if the "Open All" notification should be removed from the OS tray.
+            
+            // Initialize the flag that indicate us the "Open All" notification is in the OS tray.
+            bool isOpenAllNotificationDisplayed = false;
+            
+            // Initialize the counter used to identify the notifications that were sent by CORES (delivered notifications by a push).
+            int coresMobileNotificationsCount = 0;
+            
+            // Get the number of items displayed in the OS tray.
+            int notificationsCount = notifications.count;
+            for (int i=0; i<notificationsCount; i++){
+                
+                // Get the notification object.
+                UNNotification *existingNotification = [notifications objectAtIndex:i];
+                
+                // Check if the "Open All" notification is in the OS tray. It has an identifies the "OpenAllID" string.
+                if([existingNotification.request.identifier isEqual: @"OpenAllID"]){
+                    isOpenAllNotificationDisplayed = true;
+                }
+                
+                // Check if the current notification has the "coresPayload" object. IF that's the case then it is a notification created by a push (delivered notification).
+                NSDictionary *userInfo = existingNotification.request.content.userInfo;
+                
+                for(id key in userInfo) {
+                    
+                    if([key isEqualToString:@"coresPayload"]){
+                        
+                        NSDictionary *coresPayloadObject = [userInfo objectForKey:key];
+                        
+                        for(id coresPayloadKey in coresPayloadObject) {
+                            
+                            if([coresPayloadKey isEqualToString:@"notification_id"]){
+                                
+                                NSNumber *notificationID = [coresPayloadObject objectForKey: coresPayloadKey];
+                                
+                                // Ignore the current notification is that was removed from the tray.
+                                if([notificationID longValue] != [notId longValue]){
+                                    coresMobileNotificationsCount++;
+                                }
+                                
+                            }
+                            
+                        }
+                        
+                    }
+
+                }
+                
+            }
+            
+            // If just the "Open All" notification is displayed in the OS tray then we need to remove it, since there are not delivered notifications to open.
+            if(coresMobileNotificationsCount <= 1 && isOpenAllNotificationDisplayed == true){
+                
+                [[UNUserNotificationCenter currentNotificationCenter] removeAllDeliveredNotifications];
+                [[UNUserNotificationCenter currentNotificationCenter] removeAllPendingNotificationRequests];
+                
+            }
+            
+            // Return the response to the CORES Mobile JS app.
+            NSString *message = [NSString stringWithFormat:@"Cleared notification with ID: %@", notId];
+            CDVPluginResult *commandResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:message];
+            [self.commandDelegate sendPluginResult:commandResult callbackId:command.callbackId];
+            
+        } else {
+         
+            NSString *message = [NSString stringWithFormat:@"Notification not found in the tray: %@", notId];
+            CDVPluginResult *commandResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:message];
+            [self.commandDelegate sendPluginResult:commandResult callbackId:command.callbackId];
+            
+        }
+        
+    }];
+    
 }
 
 - (void)clearNotification:(CDVInvokedUrlCommand *)command
@@ -518,7 +721,10 @@
 
 - (void)clearAllNotifications:(CDVInvokedUrlCommand *)command
 {
-    [[UIApplication sharedApplication] setApplicationIconBadgeNumber:0];
+    //zero badge
+    // To clear the badge number without remove the notifications from the tray we need to set -1 instead of 0
+    // https://developer.apple.com/forums/thread/7598
+    [[UIApplication sharedApplication] setApplicationIconBadgeNumber:-1];
 
     NSString* message = [NSString stringWithFormat:@"cleared all notifications"];
     CDVPluginResult *commandResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:message];
