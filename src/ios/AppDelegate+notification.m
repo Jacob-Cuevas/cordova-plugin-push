@@ -234,6 +234,8 @@ NSTimer *checkPluginReadyTimer;
 }
 
 // Method called when a push notification is pressed to let your app know which action was selected by the user for a given notification.
+// METHOD COMMENTED TEMPORARILY DUE TO A COMPILATION ERROR: duplicated didReceiveNotificationResponse event.
+/*
 - (void) userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void(^)())completionHandler{
     
     // Get the data associated of the pressed notification.
@@ -260,7 +262,7 @@ NSTimer *checkPluginReadyTimer;
 
     completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
     
-}
+}*/
 
 // Method invoked to send the data of the pressed notification to the Cordova Push plugin that will be handled by the CORES Mobile JS logic.
 - (void) sendResponseDataOfPressedNotification: (NSDictionary *)userInfo : (PushPlugin *) pushHandler {
@@ -514,7 +516,7 @@ NSTimer *checkPluginReadyTimer;
 // General listener invoked when a notification is received on the phone, no matter the app status (foreground, backgroubd or stand by).
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
 didReceiveNotificationResponse:(UNNotificationResponse *)response
-         withCompletionHandler:(void(^)(void))completionHandler
+         withCompletionHandler:(void(^)())completionHandler
 {
     NSLog(@"Push Plugin didReceiveNotificationResponse: actionIdentifier %@, notification: %@", response.actionIdentifier,
           response.notification.request.content.userInfo);
@@ -530,7 +532,8 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
             pushHandler.isInline = NO;
             pushHandler.isTapped = NO;
             [pushHandler notificationReceived];
-            completionHandler();
+            // Display the notification on screen even if the phone is in foreground.
+            completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
             break;
         }
         case UIApplicationStateInactive:
@@ -538,6 +541,20 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
             NSLog(@"coldstart");
             self.launchNotification = response.notification.request.content.userInfo;
             self.coldstart = [NSNumber numberWithBool:YES];
+
+            // Get the data associated of the pressed notification.
+            NSDictionary *userInfo = response.notification.request.content.userInfo;
+
+            // Since this logic can run in a coldstart situation (when the app is closed and the OS opens it because a notification was pressed),
+            // we need to check if the Cordova plugin is ready to be invoked to send the data to the CORES Mobile JS logic.
+
+            // Create a timer object to check if the plugin is ready to be invoked, checking every second if that is ready.
+            checkPluginReadyTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                                    target:self
+                                                                    selector:@selector(onPluginReady:)
+                                                                    userInfo:userInfo
+                                                                    repeats:YES];
+
             break;
         }
         case UIApplicationStateBackground:
