@@ -9,11 +9,12 @@
 #import "AppDelegate+notification.h"
 #import "PushPlugin.h"
 #import <objc/runtime.h>
+#import <UserNotifications/UserNotifications.h>
 
 static char launchNotificationKey;
 static char coldstartKey;
 NSString *const pushPluginApplicationDidBecomeActiveNotification = @"pushPluginApplicationDidBecomeActiveNotification";
-// Timer that will be used to check if this plugin has been registered by the JS app (running the register method).
+// Timer that will be used to check if this plugin has been registered and is available to be used and send data to the app.
 NSTimer *checkPluginReadyTimer;
 
 @implementation AppDelegate (notification)
@@ -64,8 +65,13 @@ NSTimer *checkPluginReadyTimer;
                                                 name:UIApplicationDidBecomeActiveNotification
                                               object:nil];
 
+    // Cordova Plugin Push issues #1 and #5. Define a listener for the UIApplicationDidFinishLaunchingNotification event to get the data of the notification that opened the app from scratch.
+    // Also, this method is called when app is finished launching and ready to present any windows to the user (according to the lifecycle of the iOS app).
+    // https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+    // https://github.com/TransformativeMed/cordova-plugin-push/issues/1
+    // Helpful documentation about lifecycle: https://medium.com/@theiOSzone/briefly-about-the-ios-application-lifecycle-92f0c830b754
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(checkNotificationPermissions:)
+                                             selector:@selector(getDataNotificationLaunchedApp:)
                                                  name:UIApplicationDidFinishLaunchingNotification
                                                object:nil];
 
@@ -74,12 +80,15 @@ NSTimer *checkPluginReadyTimer;
     return [self pushPluginSwizzledInit];
 }
 
-// This code will be called immediately after application:didFinishLaunchingWithOptions:. We need
-// to process notifications in cold-start situations
-- (void)checkNotificationPermissions:(NSNotification *)notification
-{
-
-    // Check if the app has the following option permissions to display Normal/Critical Push Notifications on screen (sent via APNS), even if the app is on foreground:
+// Cordova Plugin Push issues #1 and #5. Initialize the listener for the UIApplicationDidFinishLaunchingNotification event that will help us to capture the data of the notification that started the app
+// from scratch. Also, since this listener also runs when the app is opened by the user then it will be used to request permissions to the user about to receive normal and critical notifications
+// at the start of the app.
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/1
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+// This code will be called immediately after application:didFinishLaunchingWithOptions event once the app is opened/loaded correctly.
+- (void)getDataNotificationLaunchedApp:(NSNotification *)notification {
+    
+    // Cordova Plugin Push issue #1. Check if the app has the following option permissions to display Normal/Critical Push Notifications on screen (sent via APNS), even if the app is on foreground.
     [UNUserNotificationCenter currentNotificationCenter].delegate = self;
     // - UNAuthorizationOptionAlert: Show notifications on screen.
     // - UNAuthorizationOptionCriticalAlert: Show critical notifications on screen.
@@ -88,16 +97,30 @@ NSTimer *checkPluginReadyTimer;
     UNAuthorizationOptions authOptions = UNAuthorizationOptionAlert | UNAuthorizationOptionCriticalAlert | UNAuthorizationOptionSound  | UNAuthorizationOptionBadge;
     [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:authOptions completionHandler:^(BOOL granted, NSError * _Nullable error) {
         if(!error){
-            NSLog(@"Native Push Notification Success");
             
-            // The following line allows us to capture the push notification when the app is in foreground and display it on the screen.
+            // The following line allows us to capture the push notification in the app.
             [[UIApplication sharedApplication] registerForRemoteNotifications];
-        } else {
-            NSLog(@"Critical Notifications disabled");
         }
     }];
-    NSLog(@"App started");
     
+    // Cordova Plugin Push issue #5.
+    // When the app is closed and is opened by a push notification (received in the phone and/or tapped by the user from the OS tray), the data of that notification must be captured to be sent
+    // to the app once it has been started. This is important to prevent the data of the pressed notification from being lost when the app is opened.
+    // Also, the coldstart flag will be updated to let us know if the app was opened from scratch.
+    if (notification)
+    {
+        NSDictionary *launchOptions = [notification userInfo];
+        if (launchOptions) {
+            NSLog(@"coldstart");
+            self.launchNotification = [launchOptions objectForKey: @"UIApplicationLaunchOptionsRemoteNotificationKey"];
+            self.coldstart = [NSNumber numberWithBool:YES];
+        } else {
+            NSLog(@"not coldstart");
+            self.coldstart = [NSNumber numberWithBool:NO];
+        }
+        
+    }
+
 }
 
 - (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
@@ -110,13 +133,15 @@ NSTimer *checkPluginReadyTimer;
     [pushHandler didFailToRegisterForRemoteNotificationsWithError:error];
 }
 
+// General listener invoked when a push notification is received on the phone, no matter the app status (foreground, background or stand by/closed),
+// but the FOREGROUND case is ignored, since it will be handled by the "willPresentNotification" event.
 - (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
     NSLog(@"didReceiveNotification with fetchCompletionHandler");
-
-    // app is in the background or inactive, so only call notification callback if this is a silent push
+    
+    // App is in background or in stand-by, send the data of the received push notification to the CORES Mobile app.
     if (application.applicationState != UIApplicationStateActive) {
 
-        NSLog(@"app in-active");
+        NSLog(@"app in background or stand-by");
 
         // do some convoluted logic to find out if this should be a silent push.
         long silent = 0;
@@ -153,17 +178,46 @@ NSTimer *checkPluginReadyTimer;
 
             pushHandler.notificationMessage = userInfo;
             pushHandler.isInline = NO;
-            [pushHandler notificationReceived];
+            
+            NSLog(@"didReceiveRemoteNotification in-background ");
+            
+            if([self.coldstart boolValue] == YES){
+                
+                // Cordova Push Plugin issues #5, #3 and #1.
+                // https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+                // https://github.com/TransformativeMed/cordova-plugin-push/issues/3
+                // https://github.com/TransformativeMed/cordova-plugin-push/issues/1
+                // Wait a few seconds before to send the data of the received push notification to the CORES Mobile JS logic,
+                // since the app was opened from scratch by the OS and and the Cordova plugin may not be available yet.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [pushHandler notificationReceived];
+                    completionHandler(UIBackgroundFetchResultNewData);
+                });
+                
+            } else {
+                
+                [pushHandler notificationReceived];
+                completionHandler(UIBackgroundFetchResultNewData);
+                
+            }
+            
         } else {
             NSLog(@"just put it in the shade");
             //save it for later
-            self.launchNotification = userInfo;
             completionHandler(UIBackgroundFetchResultNewData);
         }
 
     } else {
         completionHandler(UIBackgroundFetchResultNoData);
     }
+    
+    // Cordova Plugin Push issue #3.
+    // https://github.com/TransformativeMed/cordova-plugin-push/issues/3
+    // Since iOS will automatically group the notifications, we need to display a local push notification that will help us to open all notification
+    // at the same time in the "Notification Viewer" of the CORES Mobile app.
+    // But only if there are 1+ notifications in the Notification Center of the phone.
+    [self displayOpenAllLocalNotification];
+    
 }
 
 - (void)checkUserHasRemoteNotificationsEnabledWithCompletionHandler:(nonnull void (^)(BOOL))completionHandler
@@ -186,13 +240,20 @@ NSTimer *checkPluginReadyTimer;
 - (void)pushPluginOnApplicationDidBecomeActive:(NSNotification *)notification {
 
     NSLog(@"active");
-    
+        
     NSString *firstLaunchKey = @"firstLaunchKey";
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:@"phonegap-plugin-push"];
     if (![defaults boolForKey:firstLaunchKey]) {
         NSLog(@"application first launch: remove badge icon number");
         [defaults setBool:YES forKey:firstLaunchKey];
-        [[UIApplication sharedApplication] setApplicationIconBadgeNumber:0];
+        
+        // Cordova Plugin Push issues #3 and #5. DON'T remove the notifications from the OS tray until they are discarded or opened by the user.
+        // Also, when the user does a down swipe to open the Notification Center this event is triggered, that is why removing the notifications from the tray should be avoided.
+        // https://github.com/TransformativeMed/cordova-plugin-push/issues/3
+        // https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+        // To clear the badge number without remove the notifications from the tray we need to set -1 instead of 0.
+        // https://developer.apple.com/forums/thread/7598
+        [[UIApplication sharedApplication] setApplicationIconBadgeNumber:-1];
     }
 
     UIApplication *application = notification.object;
@@ -201,7 +262,13 @@ NSTimer *checkPluginReadyTimer;
     if (pushHandler.clearBadge) {
         NSLog(@"PushPlugin clearing badge");
         //zero badge
-        application.applicationIconBadgeNumber = 0;
+        // Cordova Plugin Push issues #3 and #5. DON'T remove the notifications from the OS tray until they are discarded or opened by the user. Only clean the badge number of the app.
+        // Also, when the user does a down swipe to open the Notification Center this event is triggered, that is why removing the notifications from the tray should be avoided.
+        // https://github.com/TransformativeMed/cordova-plugin-push/issues/3
+        // https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+        // To clear the badge number without remove the notifications from the tray we need to set -1 instead of 0.
+        // https://developer.apple.com/forums/thread/7598
+        application.applicationIconBadgeNumber = -1;
     } else {
         NSLog(@"PushPlugin skip clear badge");
     }
@@ -214,8 +281,7 @@ NSTimer *checkPluginReadyTimer;
         self.coldstart = [NSNumber numberWithBool:NO];
         [pushHandler performSelectorOnMainThread:@selector(notificationReceived) withObject:pushHandler waitUntilDone:NO];
     }
-
-    [[NSNotificationCenter defaultCenter] postNotificationName:pushPluginApplicationDidBecomeActiveNotification object:nil];
+        
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
@@ -223,56 +289,29 @@ NSTimer *checkPluginReadyTimer;
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler
 {
     NSLog( @"NotificationCenter Handle push from foreground" );
-    // custom code to handle push while app is in the foreground
+    NSLog(@"Push Plugin willPresentNotification ---------------> %@", notification.request.content.userInfo);
+    
     PushPlugin *pushHandler = [self getCommandInstance:@"PushNotification"];
     pushHandler.notificationMessage = notification.request.content.userInfo;
     pushHandler.isInline = YES;
+    pushHandler.isTapped = NO;
     [pushHandler notificationReceived];
 
-    // Display the notification on the shade including the sound and badge number contained in the push notification
+    // Cordova Plugin Push issue #3: Always displays the notification in the Notification Center of the phone even if the app is in foreground.
+    // https://github.com/TransformativeMed/cordova-plugin-push/issues/3
+    // Display the notification on the OS tray including the sound and badge number contained in the push notification.
     completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
 }
 
-// Method called when a push notification is pressed to let your app know which action was selected by the user for a given notification.
-// METHOD COMMENTED TEMPORARILY DUE TO A COMPILATION ERROR: duplicated didReceiveNotificationResponse event.
-/*
-- (void) userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void(^)())completionHandler{
-    
-    // Get the data associated of the pressed notification.
-    NSDictionary *userInfo = response.notification.request.content.userInfo;
-
-    // Since this logic can run in a coldstart situation (when the app is closed and the OS opens it because a notification was pressed),
-    // we need to check if the Cordova plugin is ready to be invoked to send the data to the CORES Mobile JS logic.
-    if([self.coldstart boolValue] == YES){
-        
-        // Create a timer object to check if the plugin is ready to be invoked, checking every second if that is ready.
-        checkPluginReadyTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
-                                                                 target:self
-                                                               selector:@selector(onPluginReady:)
-                                                               userInfo:userInfo
-                                                                repeats:YES];
-        
-    } else {
-        
-        // The app is in foreground or background, so we can immediately send the data of the pressed notification to the CORES Mobile JS logic.
-        PushPlugin *pushHandler = [self getCommandInstance:@"PushNotification"];
-        [self sendResponseDataOfPressedNotification : userInfo : pushHandler];
-        
-    }
-
-    completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
-    
-}*/
-
-// Method invoked to send the data of the pressed notification to the Cordova Push plugin that will be handled by the CORES Mobile JS logic.
+// Cordova Push Plugin issues #3 and #5. Get the data of the pressed notification (single or grouped notifications) to send it to the CORES Mobile app.
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/3
 - (void) sendResponseDataOfPressedNotification: (NSDictionary *)userInfo : (PushPlugin *) pushHandler {
-    
-    NSLog(@"Data from notification %@",userInfo);
     
     // Check if the notification was sent by the APNS (triggered by the CORES API) or it is a local push notification created by us to let the user open all notifications ("open all" notification).
     if ( [userInfo objectForKey:@"coresPayload"] ) {
         
-        // Prepare the data that will be validated in CORES Mobile and send it.
+        // A single notification was pressed. Send its data to the CORES Mobile app, initializing some values as empty and indicating it was tapped.
         pushHandler.notificationMessage = userInfo;
         pushHandler.isTapped = YES;
         pushHandler.notificationIDsToOpen = @"";
@@ -282,7 +321,7 @@ NSTimer *checkPluginReadyTimer;
         
     } else {
     
-        // This is a local push notification.
+        // This is a local push notification (grouped notifications).
         // Initialize the data that will be sent to the CORES Mobile app to show all notifications in the Inbox page (the Notification Viewer mode of that component).
         NSMutableArray *notificationIDlistToOpen = [[NSMutableArray alloc] init];
         
@@ -330,7 +369,7 @@ NSTimer *checkPluginReadyTimer;
             // Create a single string with all notification IDs, concatenating them with a comma.
             NSString *notificationsToOpen = [notificationIDlistToOpen componentsJoinedByString:@","];
             
-            // Prepare the data to send the notification data to the app.
+            // Prepare the data to send the notification data to the CORES Mobie app.
             pushHandler.isTapped = YES;
             pushHandler.coldstart = [self.coldstart boolValue];
             pushHandler.notificationIDsToOpen = notificationsToOpen;
@@ -343,7 +382,9 @@ NSTimer *checkPluginReadyTimer;
 
 }
 
-// Method invoked to verify if the Cordova Push plugin is ready to be used before to send data to the CORES Mobile JS logic.
+// Cordova Plugin Push issue #5.
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+// Method invoked to verify if the Cordova Plugin Push is ready to invoke the method used to send data to the CORES Mobile app.
 - (void) onPluginReady:(NSTimer *)timer {
     
     // Get from the timer the response data of the pressed notification (the method who invoked this function, check the "didReceiveNotificationResponse" method ).
@@ -365,6 +406,8 @@ NSTimer *checkPluginReadyTimer;
     }
 }
 
+// Cordova Plugin Push #3.
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/3
 // Method used to create a local/scheduled notification that will be displayed at the top of all app notifications to let the user open all of them in the Inbox page.
 - (void) displayOpenAllLocalNotification {
     
@@ -513,37 +556,46 @@ NSTimer *checkPluginReadyTimer;
     
 }
 
-// General listener invoked when a notification is received on the phone, no matter the app status (foreground, backgroubd or stand by).
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
-didReceiveNotificationResponse:(UNNotificationResponse *)response
+// Cordova Plugin Push #5. Method called when a push notification is pressed to let the CORES Mobile app know which action was selected by the user for a given notification (single or grouped notifications).
+// According to the app status (foreground, background or closed) the app will flex its content.
+// https://github.com/TransformativeMed/cordova-plugin-push/issues/5
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void(^)())completionHandler
 {
     NSLog(@"Push Plugin didReceiveNotificationResponse: actionIdentifier %@, notification: %@", response.actionIdentifier,
           response.notification.request.content.userInfo);
+    
     NSMutableDictionary *userInfo = [response.notification.request.content.userInfo mutableCopy];
-    [userInfo setObject:response.actionIdentifier forKey:@"actionCallback"];
+    
+    // If the notification has no actions, then we can assume this event was triggered by a tapped notification.
+    if([response.actionIdentifier rangeOfString:@"UNNotificationDefaultActionIdentifier"].location == NSNotFound) {
+        [userInfo setObject:response.actionIdentifier forKey:@"actionCallback"];
+    }
+    
     NSLog(@"Push Plugin userInfo %@", userInfo);
-
+    
     switch ([UIApplication sharedApplication].applicationState) {
         case UIApplicationStateActive:
         {
+            // The app is in foreground or background, so we can immediately send the data of the pressed notification to the CORES Mobile JS logic.
             PushPlugin *pushHandler = [self getCommandInstance:@"PushNotification"];
-            pushHandler.notificationMessage = userInfo;
-            pushHandler.isInline = NO;
-            pushHandler.isTapped = NO;
-            [pushHandler notificationReceived];
-            // Display the notification on screen even if the phone is in foreground.
-            completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
+            [self sendResponseDataOfPressedNotification : userInfo : pushHandler];
+            completionHandler();
+            
             break;
         }
         case UIApplicationStateInactive:
         {
             NSLog(@"coldstart");
-            self.launchNotification = response.notification.request.content.userInfo;
+            
+            if([response.actionIdentifier rangeOfString:@"UNNotificationDefaultActionIdentifier"].location == NSNotFound) {
+                self.launchNotification = userInfo;
+            }
+            else {
+                self.launchNotification = response.notification.request.content.userInfo;
+            }
+            
             self.coldstart = [NSNumber numberWithBool:YES];
-
-            // Get the data associated of the pressed notification.
-            NSDictionary *userInfo = response.notification.request.content.userInfo;
 
             // Since this logic can run in a coldstart situation (when the app is closed and the OS opens it because a notification was pressed),
             // we need to check if the Cordova plugin is ready to be invoked to send the data to the CORES Mobile JS logic.
@@ -554,7 +606,6 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
                                                                     selector:@selector(onPluginReady:)
                                                                     userInfo:userInfo
                                                                     repeats:YES];
-
             break;
         }
         case UIApplicationStateBackground:
@@ -585,13 +636,11 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
 
             [pushHandler performSelectorOnMainThread:@selector(notificationReceived) withObject:pushHandler waitUntilDone:NO];
         }
-
-        // Since iOS will automatically group the notifications, we need to display a local push notification that will help us to open all notification
-        // at the same time in the "Notification Viewer" of the CORES Mobile app.
-        // But only if there are 1+ notifications in the Notification Center of the phone.
-        [self displayOpenAllLocalNotification];
+        
     }
+    
 }
+
 
 // The accessors use an Associative Reference since you can't define a iVar in a category
 // http://developer.apple.com/library/ios/#documentation/cocoa/conceptual/objectivec/Chapters/ocAssociativeReferences.html
